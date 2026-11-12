@@ -1,24 +1,29 @@
-# rag.py
 
 """A small, self-contained RAG (retrieval-augmented generation) module.
 
-Documents in the ``knowledge/`` folder are read, split into chunks, and
-indexed with plain TF-IDF.  When a question is routed to the knowledge
-base, the most similar chunks are retrieved and given to the LLM as
-context.
+Documents in the knowledge/ folder are read, split into chunks, and
+indexed using semantic embeddings.
 
-No vector database or embedding model is required.
+A free Sentence Transformers model converts documents and questions
+into numerical vectors. Cosine similarity is then used to retrieve
+the most relevant chunks.
+
+No paid API or vector database is required.
 """
 
 import csv
 import hashlib
 import json
-import math
 import re
 import shutil
+import os
+from dotenv import load_dotenv
+
+import numpy as np
 
 from collections import Counter
 from pathlib import Path
+from sentence_transformers import SentenceTransformer
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +39,16 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
 TOP_K = 4
+
+# Minimum cosine similarity required for retrieval.
 MIN_SCORE = 0.10
+
+load_dotenv()
+
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME",
+    "sentence-transformers/all-MiniLM-L6-v2",
+)
 
 OCR_ENABLED = True
 OCR_DPI = 150
@@ -50,7 +64,7 @@ SUPPORTED_EXTENSIONS = {
     ".htm",
 }
 
-# Very common words add no useful meaning to a search.
+# Very common words add no useful meaning to keyword coverage.
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "do", "does",
     "for", "from", "has", "have", "how", "i", "in", "is", "it", "its",
@@ -60,8 +74,36 @@ STOPWORDS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# CACHES
+# ---------------------------------------------------------------------------
+
 # The index is built once and reused until a document is added or removed.
 _INDEX_CACHE = None
+
+# The embedding model is loaded only once per application process.
+_EMBEDDING_MODEL = None
+
+
+# ---------------------------------------------------------------------------
+# LOAD EMBEDDING MODEL
+# ---------------------------------------------------------------------------
+
+def get_embedding_model():
+    """Load and return the embedding model."""
+
+    global _EMBEDDING_MODEL
+
+    if _EMBEDDING_MODEL is None:
+        print("Loading embedding model...")
+
+        _EMBEDDING_MODEL = SentenceTransformer(
+            EMBEDDING_MODEL_NAME,
+        )
+
+        print("Embedding model loaded successfully.")
+
+    return _EMBEDDING_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +332,7 @@ def chunk_text(
 # ---------------------------------------------------------------------------
 
 def _singular(word: str) -> str:
-    """A tiny plural normaliser, e.g. "laws" -> "law"."""
+    """A tiny plural normaliser, e.g. 'laws' -> 'law'."""
 
     if word.endswith("ies") and len(word) > 4:
         return word[:-3] + "y"
@@ -318,7 +360,7 @@ def tokenize(text: str) -> list:
 # ---------------------------------------------------------------------------
 
 def build_index(force: bool = False) -> dict:
-    """Build the TF-IDF index for every file in knowledge/."""
+    """Build the embedding index for every file in knowledge/."""
 
     global _INDEX_CACHE
 
@@ -335,6 +377,8 @@ def refresh_index() -> dict:
 
 
 def _create_index() -> dict:
+    """Extract, chunk, and convert documents into embeddings."""
+
     documents = []
     chunks = []
 
@@ -379,36 +423,25 @@ def _create_index() -> dict:
                 "tokens": tokens,
             })
 
-    # Document frequency: how many chunks contain each word.
-    document_frequency = Counter()
+    # Generate embeddings for all chunks.
+    if chunks:
+        model = get_embedding_model()
 
-    for chunk in chunks:
-        document_frequency.update(set(chunk["tokens"]))
+        texts = [chunk["content"] for chunk in chunks]
 
-    total_chunks = len(chunks)
-
-    idf = {
-        token: math.log((1 + total_chunks) / (1 + frequency)) + 1
-        for token, frequency in document_frequency.items()
-    }
-
-    # Pre-compute a normalised TF-IDF vector for every chunk.
-    for chunk in chunks:
-        counts = Counter(chunk["tokens"])
-        length = len(chunk["tokens"])
-
-        weights = {
-            token: (count / length) * idf[token]
-            for token, count in counts.items()
-        }
-
-        chunk["weights"] = weights
-        chunk["norm"] = math.sqrt(
-            sum(weight * weight for weight in weights.values())
+        embeddings = model.encode(
+            texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
         )
 
-        del chunk["tokens"]
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+    else:
+        embeddings = np.empty((0, 384), dtype=np.float32)
 
+    # Preserve keyword tokens for the coverage calculation in retrieve().
+    # They do not calculate semantic similarity.
     sources = []
 
     for document in documents:
@@ -418,7 +451,7 @@ def _create_index() -> dict:
     return {
         "documents": documents,
         "chunks": chunks,
-        "idf": idf,
+        "embeddings": embeddings,
         "sources": sources,
     }
 
@@ -427,7 +460,11 @@ def _create_index() -> dict:
 # RETRIEVE
 # ---------------------------------------------------------------------------
 
-def _make_result(chunk: dict, score: float = 0.0, coverage: float = 0.0) -> dict:
+def _make_result(
+    chunk: dict,
+    score: float = 0.0,
+    coverage: float = 0.0,
+) -> dict:
     """Turn an indexed chunk into a retrieval result."""
 
     return {
@@ -438,8 +475,8 @@ def _make_result(chunk: dict, score: float = 0.0, coverage: float = 0.0) -> dict
             "chunk_number": chunk["chunk_number"],
             "total_chunks": chunk["total_chunks"],
         },
-        "score": score,
-        "coverage": coverage,
+        "score": float(score),
+        "coverage": float(coverage),
     }
 
 
@@ -450,7 +487,7 @@ def retrieve(
     sources: list = None,
     min_score: float = None,
 ) -> list:
-    """Return the chunks most similar to the question."""
+    """Retrieve the most semantically similar chunks using embeddings."""
 
     if index is None:
         index = build_index()
@@ -458,82 +495,87 @@ def retrieve(
     if min_score is None:
         min_score = MIN_SCORE
 
-    tokens = tokenize(question)
+    chunks = index["chunks"]
+    embeddings = index["embeddings"]
 
-    if not tokens or not index["chunks"]:
+    if not chunks:
         return []
 
-    counts = Counter(tokens)
-    length = len(tokens)
-    idf = index["idf"]
-
-    query_terms = set(tokens)
-    query_term_count = len(query_terms)
-
-    question_weights = {
-        token: (count / length) * idf[token]
-        for token, count in counts.items()
-        if token in idf
-    }
-
-    question_norm = math.sqrt(
-        sum(weight * weight for weight in question_weights.values())
-    )
-
+    # Optional source restriction.
     allowed = (
         {source.casefold() for source in sources}
         if sources
         else None
     )
 
-    if question_norm == 0:
-        # The question has no searchable words (for example "summarize
-        # scanned.pdf"). Return the first chunks of a named file so it can
-        # still be summarised.
+    # Preserve the original keyword-based coverage calculation.
+    tokens = tokenize(question)
+
+    if not tokens:
+        # Allows requests such as "summarize report.pdf".
+        # Return chunks from the named file even without searchable keywords.
         if not allowed:
             return []
 
         return [
             _make_result(chunk)
-            for chunk in index["chunks"]
+            for chunk in chunks
             if chunk["filename"].casefold() in allowed
         ][:top_k]
 
+    query_terms = set(tokens)
+
+    # Convert the user's question into an embedding.
+    model = get_embedding_model()
+
+    question_embedding = model.encode(
+        question,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+    question_embedding = np.asarray(
+        question_embedding,
+        dtype=np.float32,
+    )
+
+    # Because both vectors are normalized, dot product = cosine similarity.
+    scores = embeddings @ question_embedding
+
     results = []
 
-    for chunk in index["chunks"]:
+    for position, chunk in enumerate(chunks):
+
         if allowed and chunk["filename"].casefold() not in allowed:
             continue
 
-        dot = sum(
-            weight * chunk["weights"].get(token, 0.0)
-            for token, weight in question_weights.items()
-        )
- 
-        score = (
-            dot / (question_norm * chunk["norm"])
-            if chunk["norm"]
-            else 0.0
-        )
+        score = float(scores[position])
 
         if score < min_score:
             continue
 
+        # Keyword coverage remains available for existing agent routing.
+        chunk_terms = set(chunk["tokens"])
+
         matched_terms = sum(
-            1
-            for token in query_terms
-            if token in chunk["weights"]
+            1 for token in query_terms if token in chunk_terms
         )
+
+        coverage = matched_terms / len(query_terms)
 
         results.append(
             _make_result(
                 chunk,
                 score=score,
-                coverage=matched_terms / query_term_count,
+                coverage=coverage,
             )
         )
 
-    results.sort(key=lambda result: result["score"], reverse=True)
+    results.sort(
+        key=lambda result: result["score"],
+        reverse=True,
+    )
 
     return results[:top_k]
 
